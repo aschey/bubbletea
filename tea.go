@@ -464,7 +464,6 @@ func (p *Program) Run() (Model, error) {
 			return model, err
 		}
 		defer p.cancelReader.Close() //nolint:errcheck
-		handlers.add(p.readLoopDone)
 	}
 
 	// Handle resize events.
@@ -564,7 +563,7 @@ func (p *Program) shutdown(kill bool) {
 // reader. You can return control to the Program with RestoreTerminal.
 func (p *Program) ReleaseTerminal() error {
 	p.ignoreSignals = true
-	p.cancelInput()
+	p.cancelReader.Cancel()
 	p.waitForReadLoop()
 
 	p.altScreenWasActive = p.renderer.altScreen()
