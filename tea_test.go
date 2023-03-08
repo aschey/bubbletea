@@ -2,6 +2,7 @@ package tea
 
 import (
 	"bytes"
+	"context"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -130,8 +131,30 @@ func TestTeaKill(t *testing.T) {
 		}
 	}()
 
-	if _, err := p.Run(); err != nil {
-		t.Fatal(err)
+	if _, err := p.Run(); err != ErrProgramKilled {
+		t.Fatalf("Expected %v, got %v", ErrProgramKilled, err)
+	}
+}
+
+func TestTeaContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var buf bytes.Buffer
+	var in bytes.Buffer
+
+	m := &testModel{}
+	p := NewProgram(m, WithContext(ctx), WithInput(&in), WithOutput(&buf))
+	go func() {
+		for {
+			time.Sleep(time.Millisecond)
+			if m.executed.Load() != nil {
+				cancel()
+				return
+			}
+		}
+	}()
+
+	if _, err := p.Run(); err != ErrProgramKilled {
+		t.Fatalf("Expected %v, got %v", ErrProgramKilled, err)
 	}
 }
 
@@ -146,7 +169,7 @@ func TestTeaBatchMsg(t *testing.T) {
 	m := &testModel{}
 	p := NewProgram(m, WithInput(&in), WithOutput(&buf))
 	go func() {
-		p.Send(batchMsg{inc, inc})
+		p.Send(BatchMsg{inc, inc})
 
 		for {
 			time.Sleep(time.Millisecond)
@@ -186,4 +209,54 @@ func TestTeaSequenceMsg(t *testing.T) {
 	if m.counter.Load() != 2 {
 		t.Fatalf("counter should be 2, got %d", m.counter.Load())
 	}
+}
+
+func TestTeaSequenceMsgWithBatchMsg(t *testing.T) {
+	var buf bytes.Buffer
+	var in bytes.Buffer
+
+	inc := func() Msg {
+		return incrementMsg{}
+	}
+	batch := func() Msg {
+		return BatchMsg{inc, inc}
+	}
+
+	m := &testModel{}
+	p := NewProgram(m, WithInput(&in), WithOutput(&buf))
+	go p.Send(sequenceMsg{batch, inc, Quit})
+
+	if _, err := p.Run(); err != nil {
+		t.Fatal(err)
+	}
+
+	if m.counter.Load() != 3 {
+		t.Fatalf("counter should be 3, got %d", m.counter.Load())
+	}
+}
+
+func TestTeaSend(t *testing.T) {
+	var buf bytes.Buffer
+	var in bytes.Buffer
+
+	m := &testModel{}
+	p := NewProgram(m, WithInput(&in), WithOutput(&buf))
+
+	// sending before the program is started is a blocking operation
+	go p.Send(Quit())
+
+	if _, err := p.Run(); err != nil {
+		t.Fatal(err)
+	}
+
+	// sending a message after program has quit is a no-op
+	p.Send(Quit())
+}
+
+func TestTeaNoRun(t *testing.T) {
+	var buf bytes.Buffer
+	var in bytes.Buffer
+
+	m := &testModel{}
+	NewProgram(m, WithInput(&in), WithOutput(&buf))
 }

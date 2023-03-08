@@ -11,6 +11,7 @@ package tea
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -18,14 +19,16 @@ import (
 	"runtime/debug"
 	"sync"
 	"syscall"
-	"time"
 
 	"github.com/containerd/console"
 	isatty "github.com/mattn/go-isatty"
 	"github.com/muesli/cancelreader"
 	"github.com/muesli/termenv"
-	"golang.org/x/term"
+	"golang.org/x/sync/errgroup"
 )
+
+// ErrProgramKilled is returned by [Program.Run] when the program got killed.
+var ErrProgramKilled = errors.New("program was killed")
 
 // Msg contain data from the result of a IO operation. Msgs trigger the update
 // function and, henceforth, the UI.
@@ -91,7 +94,8 @@ type Program struct {
 	// treated as bits. These options can be set via various ProgramOptions.
 	startupOptions startupOptions
 
-	ctx context.Context
+	ctx    context.Context
+	cancel context.CancelFunc
 
 	msgs chan Msg
 	errs chan error
@@ -110,8 +114,6 @@ type Program struct {
 	// was the altscreen active before releasing the terminal?
 	altScreenWasActive bool
 	ignoreSignals      bool
-
-	killc chan bool
 
 	// Stores the original reference to stdin for cases where input is not a
 	// TTY on windows and we've automatically opened CONIN$ to receive input.
@@ -153,13 +155,20 @@ func NewProgram(model Model, opts ...ProgramOption) *Program {
 		initialModel: model,
 		input:        os.Stdin,
 		msgs:         make(chan Msg),
-		killc:        make(chan bool, 1),
 	}
 
 	// Apply all options to the program.
 	for _, opt := range opts {
 		opt(p)
 	}
+
+	// A context can be provided with a ProgramOption, but if none was provided
+	// we'll use the default background context.
+	if p.ctx == nil {
+		p.ctx = context.Background()
+	}
+	// Initialize context and teardown channel.
+	p.ctx, p.cancel = context.WithCancel(p.ctx)
 
 	// if no output was set, set it to stdout
 	if p.output == nil {
@@ -216,20 +225,10 @@ func (p *Program) handleResize() chan struct{} {
 
 	if f, ok := p.output.TTY().(*os.File); ok && isatty.IsTerminal(f.Fd()) {
 		// Get the initial terminal size and send it to the program.
-		go func() {
-			w, h, err := term.GetSize(int(f.Fd()))
-			if err != nil {
-				p.errs <- err
-			}
-
-			select {
-			case <-p.ctx.Done():
-			case p.msgs <- WindowSizeMsg{w, h}:
-			}
-		}()
+		go p.checkResize()
 
 		// Listen for window resizes.
-		go listenForResize(p.ctx, f, p.msgs, p.errs, ch)
+		go p.listenForResize(ch)
 	} else {
 		close(ch)
 	}
@@ -261,10 +260,8 @@ func (p *Program) handleCommands(cmds chan Cmd) chan struct{} {
 				// possible to cancel them so we'll have to leak the goroutine
 				// until Cmd returns.
 				go func() {
-					select {
-					case p.msgs <- cmd():
-					case <-p.ctx.Done():
-					}
+					msg := cmd() // this can be long.
+					p.Send(msg)
 				}()
 			}
 		}
@@ -278,8 +275,8 @@ func (p *Program) handleCommands(cmds chan Cmd) chan struct{} {
 func (p *Program) eventLoop(model Model, cmds chan Cmd) (Model, error) {
 	for {
 		select {
-		case <-p.killc:
-			return nil, nil
+		case <-p.ctx.Done():
+			return model, nil
 
 		case err := <-p.errs:
 			return model, err
@@ -322,7 +319,7 @@ func (p *Program) eventLoop(model Model, cmds chan Cmd) (Model, error) {
 				// NB: this blocks.
 				p.exec(msg.cmd, msg.fn)
 
-			case batchMsg:
+			case BatchMsg:
 				for _, cmd := range msg {
 					cmds <- cmd
 				}
@@ -332,9 +329,24 @@ func (p *Program) eventLoop(model Model, cmds chan Cmd) (Model, error) {
 				go func() {
 					// Execute commands one at a time, in order.
 					for _, cmd := range msg {
-						select {
-						case p.msgs <- cmd():
-						case <-p.ctx.Done():
+						if cmd == nil {
+							continue
+						}
+						msg := cmd()
+						if batchMsg, ok := msg.(BatchMsg); ok {
+							g, _ := errgroup.WithContext(p.ctx)
+							for _, cmd := range batchMsg {
+								cmd := cmd
+								g.Go(func() error {
+									p.Send(cmd())
+									return nil
+								})
+							}
+							//nolint:errcheck
+							g.Wait() // wait for all commands from batch msg to finish
+							continue
+						} else {
+							p.Send(msg)
 						}
 					}
 				}()
@@ -361,9 +373,7 @@ func (p *Program) Run() (Model, error) {
 	cmds := make(chan Cmd)
 	p.errs = make(chan error)
 
-	var cancelContext context.CancelFunc
-	p.ctx, cancelContext = context.WithCancel(context.Background())
-	defer cancelContext()
+	defer p.cancel()
 
 	switch {
 	case p.startupOptions.has(withInputTTY):
@@ -372,6 +382,7 @@ func (p *Program) Run() (Model, error) {
 		if err != nil {
 			return p.initialModel, err
 		}
+		defer f.Close() //nolint:errcheck
 		p.input = f
 
 	case !p.startupOptions.has(withCustomInput):
@@ -391,11 +402,8 @@ func (p *Program) Run() (Model, error) {
 		if err != nil {
 			return p.initialModel, err
 		}
-		p.input = f
-	}
-
-	if f, ok := p.input.(io.ReadCloser); ok {
 		defer f.Close() //nolint:errcheck
+		p.input = f
 	}
 
 	// Handle signals.
@@ -463,7 +471,6 @@ func (p *Program) Run() (Model, error) {
 		if err := p.initCancelReader(); err != nil {
 			return model, err
 		}
-		defer p.cancelReader.Close() //nolint:errcheck
 	}
 
 	// Handle resize events.
@@ -474,20 +481,31 @@ func (p *Program) Run() (Model, error) {
 
 	// Run event loop, handle updates and draw.
 	model, err := p.eventLoop(model, cmds)
+	killed := p.ctx.Err() != nil
+	if killed {
+		err = ErrProgramKilled
+	} else {
+		// Ensure we rendered the final state of the model.
+		p.renderer.write(model.View())
+	}
 
 	// Tear down.
-	cancelContext()
+	p.cancel()
 
-	// Wait for input loop to finish.
-	if p.cancelReader.Cancel() {
-		p.waitForReadLoop()
+	// Check if the cancel reader has been setup before waiting and closing.
+	if p.cancelReader != nil {
+		// Wait for input loop to finish.
+		if p.cancelReader.Cancel() {
+			p.waitForReadLoop()
+		}
+		_ = p.cancelReader.Close()
 	}
 
 	// Wait for all handlers to finish.
 	handlers.shutdown()
 
 	// Restore terminal state.
-	p.shutdown(false)
+	p.shutdown(killed)
 
 	return model, err
 }
@@ -515,10 +533,13 @@ func (p *Program) Start() error {
 // messages to be injected from outside the program for interoperability
 // purposes.
 //
-// If the program is not running this will be a no-op, so it's safe to
+// If the program is not running this this will be a no-op, so it's safe to
 // send messages if the program is unstarted, or has exited.
 func (p *Program) Send(msg Msg) {
-	p.msgs <- msg
+	select {
+	case <-p.ctx.Done():
+	case p.msgs <- msg:
+	}
 }
 
 // Quit is a convenience function for quitting Bubble Tea programs. Use it
@@ -534,9 +555,9 @@ func (p *Program) Quit() {
 
 // Kill stops the program immediately and restores the former terminal state.
 // The final render that you would normally see when quitting will be skipped.
+// [program.Run] returns a [ErrProgramKilled] error.
 func (p *Program) Kill() {
-	p.killc <- true
-	p.shutdown(true)
+	p.cancel()
 }
 
 // shutdown performs operations to free up resources and restore the terminal
@@ -549,11 +570,8 @@ func (p *Program) shutdown(kill bool) {
 			p.renderer.stop()
 		}
 	}
-	p.ExitAltScreen()
-	p.DisableMouseCellMotion()
-	p.DisableMouseAllMotion()
-	_ = p.restoreTerminalState()
 
+	_ = p.restoreTerminalState()
 	if p.restoreOutput != nil {
 		_ = p.restoreOutput()
 	}
@@ -566,11 +584,11 @@ func (p *Program) ReleaseTerminal() error {
 	p.cancelReader.Cancel()
 	p.waitForReadLoop()
 
-	p.altScreenWasActive = p.renderer.altScreen()
-	if p.renderer.altScreen() {
-		p.ExitAltScreen()
-		time.Sleep(time.Millisecond * 10) // give the terminal a moment to catch up
+	if p.renderer != nil {
+		p.renderer.stop()
 	}
+
+	p.altScreenWasActive = p.renderer.altScreen()
 	return p.restoreTerminalState()
 }
 
@@ -593,6 +611,15 @@ func (p *Program) RestoreTerminal() error {
 		// entering alt screen already causes a repaint.
 		go p.Send(repaintMsg{})
 	}
+	if p.renderer != nil {
+		p.renderer.start()
+	}
+
+	// If the output is a terminal, it may have been resized while another
+	// process was at the foreground, in which case we may not have received
+	// SIGWINCH. Detect any size change now and propagate the new size as
+	// needed.
+	go p.checkResize()
 
 	return nil
 }

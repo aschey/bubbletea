@@ -1,6 +1,7 @@
 package tea
 
 import (
+	"context"
 	"io"
 
 	"github.com/muesli/termenv"
@@ -13,6 +14,15 @@ import (
 //
 //	p := NewProgram(model, WithInput(someInput), WithOutput(someOutput))
 type ProgramOption func(*Program)
+
+// WithContext lets you specify a context in which to run the Program. This is
+// useful if you want to cancel the execution from outside. When a Program gets
+// cancelled it will exit with an error ErrProgramKilled.
+func WithContext(ctx context.Context) ProgramOption {
+	return func(p *Program) {
+		p.ctx = ctx
+	}
+}
 
 // WithOutput sets the output which, by default, is stdout. In most cases you
 // won't need to use this.
@@ -31,7 +41,7 @@ func WithInput(input io.Reader) ProgramOption {
 	}
 }
 
-// WithInputTTY open a new TTY for input (or console input device on Windows).
+// WithInputTTY opens a new TTY for input (or console input device on Windows).
 func WithInputTTY() ProgramOption {
 	return func(p *Program) {
 		p.startupOptions |= withInputTTY
@@ -134,7 +144,7 @@ func WithoutRenderer() ProgramOption {
 // WithANSICompressor removes redundant ANSI sequences to produce potentially
 // smaller output, at the cost of some processing overhead.
 //
-// This feature is provisional, and may be changed removed in a future version
+// This feature is provisional, and may be changed or removed in a future version
 // of this package.
 func WithANSICompressor() ProgramOption {
 	return func(p *Program) {

@@ -124,7 +124,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
     case tea.KeyMsg:
         // Ctrl+c exits. Even with short running programs it's good to have
-        // a quit key, just incase your logic is off. Users will be very
+        // a quit key, just in case your logic is off. Users will be very
         // annoyed if they can't exit.
         if msg.Type == tea.KeyCtrlC {
             return m, tea.Quit
@@ -176,7 +176,7 @@ func main() {
 }
 ```
 
-And that's that. There's one more thing you that is helpful to know about
+And that's that. There's one more thing that is helpful to know about
 `Cmd`s, though.
 
 ## One More Thing About Commands
@@ -189,7 +189,7 @@ that returns a command. For example:
 ```go
 func cmdWithArg(id int) tea.Cmd {
     return func() tea.Msg {
-        return someMsg{id: int}
+        return someMsg{id: id}
     }
 }
 ```
@@ -235,8 +235,8 @@ And, of course, check out the [Go Docs][docs].
 We'd love to hear your thoughts on this tutorial. Feel free to drop us a note!
 
 * [Twitter](https://twitter.com/charmcli)
-* [The Fediverse](https://mastodon.technology/@charm)
-* [Slack](https://charm.sh/slack)
+* [The Fediverse](https://mastodon.social/@charmcli)
+* [Discord](https://charm.sh/chat)
 
 ***
 
